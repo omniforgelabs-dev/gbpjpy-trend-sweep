@@ -1,19 +1,14 @@
 services:
-  - type: worker
+  - type: web
     name: gbpjpy-trend-sweep
     runtime: node
-    plan: starter
-    disk:
-      name: gbpjpy-state
-      mountPath: /var/data
-      sizeGB: 1
+    plan: free
     buildCommand: npm install && npm run build
     startCommand: npm run start:prod
+    healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
-      - key: STATE_DIR
-        value: /var/data
       - key: EXN_IS_DEMO
         value: "true"
       - key: EXN_GATEWAY_HOST

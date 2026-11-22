@@ -2,7 +2,7 @@
 
 A completely independent, lightweight, headless automated trading bot for **GBP/JPY** running the original **Trend-Following Liquidity Sweep with Momentum Rejection (Trend Sweep 🌊, Option A)** strategy recovered from the APEX quant research archive.
 
-Directly integrated with the **Exness Trading API v1.0.2** using native RFC 8032 Ed25519 request signing. Designed for deployment as a 24/7 background worker on **Render** with persistent state recovery across reboots.
+Directly integrated with the **Exness Trading API v1.0.2** using native RFC 8032 Ed25519 request signing. Built with a built-in HTTP health check endpoint (`/health`) designed for deployment on **Render's Free Web Service plan**.
 
 ---
 
@@ -42,116 +42,112 @@ This bot executes the exact zero-lookahead specification recovered from `trendSw
 
 ---
 
-## 3. Render Persistent Disk & Crash Recovery
+## 3. Minimal HTTP Health Endpoint (`/health`)
 
-Render background workers run on an ephemeral filesystem by default (local files are cleared on redeploy or service reboot).
+To deploy on **Render's Free Web Service plan**, the bot runs a zero-overhead native HTTP server on `0.0.0.0:${PORT}` alongside the trading cycle:
 
-To guarantee that active trade recovery (`tp1Hit`, `currentSl`, Breakeven, open tickets, deduplication records) survives restarts and redeployments, this project is pre-configured to use a **Render Persistent Disk**:
-
-- **Disk Name**: `gbpjpy-state`
-- **Mount Path**: `/var/data`
-- **Size**: `1 GB` (standard minimum, ample for hundreds of thousands of state records)
-- **Environment Variable**: `STATE_DIR=/var/data` (routes `bot_state.json` directly onto the mounted persistent disk).
-- **Fallback**: When run locally without a mounted disk, it automatically saves to `./data/bot_state.json`.
-
----
-
-## 4. Exness Discovery & Gateway Host Configuration
-
-Exness does not use a single static trading server. Instead:
-1. In your **Exness Personal Area** $\rightarrow$ **Settings** $\rightarrow$ **API** $\rightarrow$ **API Key Management**, your account displays an assigned **Gateway Host / DNS Widget** (e.g., `https://api.exness-api.com` or custom gateway).
-2. Enter that hostname into the `EXN_GATEWAY_HOST` environment variable.
-3. On startup, the bot queries `GET /v1/trading/access-point?account_id=<ACCOUNT_ID>` with signed Ed25519 headers against your gateway host to automatically discover your account's dedicated trading **Access Point** (e.g., `https://trade-fra.exness.com`).
-4. If discovery ever encounters a temporary DNS or gateway timeout, the bot automatically falls back through standard Exness gateways (`https://api.exness-api.com`, `https://api.exness.com`) and logs the resolved endpoint in your Render console.
-5. If Exness ever provides a direct Access Point URL, you can optionally override discovery entirely with `EXN_ACCESS_POINT_URL`.
-
----
-
-## 5. Render Deployment Instructions (Background Worker)
-
-### Option A: 1-Click Blueprint Deploy (Recommended)
-
-1. Push this repository to GitHub: `https://github.com/<your-username>/gbpjpy-trend-sweep`.
-2. Log into [Render Dashboard](https://dashboard.render.com/).
-3. Click **New +** $\rightarrow$ **Blueprint**.
-4. Connect the `gbpjpy-trend-sweep` repository. Render reads `render.yaml` and will automatically configure:
-   - Worker runtime: Node
-   - Build & Start commands
-   - Persistent Disk (`gbpjpy-state` mounted at `/var/data`)
-5. Enter your Exness API credentials under Environment Variables and deploy!
-
-### Option B: Manual Background Worker Setup
-
-1. In Render Dashboard, click **New +** $\rightarrow$ **Background Worker**.
-2. Select your `gbpjpy-trend-sweep` GitHub repository.
-3. Configure settings:
-   - **Name**: `gbpjpy-trend-sweep`
-   - **Region**: Closest to your broker (e.g., Frankfurt or London for lowest latency).
-   - **Branch**: `main`
-   - **Runtime**: `Node`
-   - **Build Command**: `npm install && npm run build`
-   - **Start Command**: `npm run start:prod`
-   - **Plan**: `Starter` (guarantees continuous 24/7 background execution without idle spin-down).
-4. Attach a **Persistent Disk**:
-   - Scroll down to **Disks** $\rightarrow$ click **Add Disk**.
-   - **Name**: `gbpjpy-state`
-   - **Mount Path**: `/var/data`
-   - **Size**: `1 GB`
-5. Add the **Environment Variables** (see table below).
-6. Click **Create Background Worker**.
+- **Endpoint**: `GET /health` (or `/` or `/healthz`)
+- **Response**: HTTP 200 with status JSON:
+  ```json
+  {
+    "status": "healthy",
+    "service": "gbpjpy-trend-sweep",
+    "pair": "GBP/JPY",
+    "mode": "demo",
+    "executionEngine": "simulation",
+    "uptimeSeconds": 120,
+    "activeTrade": false,
+    "activeTradeId": null,
+    "lastHeartbeat": "2026-11-22T23:15:00.000Z",
+    "timestamp": "2026-11-22T23:15:10.000Z"
+  }
+  ```
+- **Safety Guarantee**: The health server is strictly read-only; it does not execute orders, alter positions, or affect strategy logic.
+- **Graceful Shutdown**: Shuts down cleanly on SIGTERM/SIGINT alongside the trading loop.
 
 ---
 
-## 6. Required Environment Variables
+## 4. Render Free Web Service Deployment Instructions
 
-Configure these in **Render Dashboard** $\rightarrow$ **Service** $\rightarrow$ **Environment**:
+### Step 1: Create Free Web Service
+1. Log into your [Render Dashboard](https://dashboard.render.com/).
+2. Click **New +** $\rightarrow$ **Web Service**.
+3. Connect your repository: **`omniforgelabs-dev/gbpjpy-trend-sweep`**.
 
-| Variable Name | Recommended Initial Value | Description |
+### Step 2: Configure Service Settings
+- **Name**: `gbpjpy-trend-sweep`
+- **Region**: Frankfurt (EU Central) or London (closest to Exness servers).
+- **Branch**: `main`
+- **Runtime**: `Node`
+- **Build Command**: `npm install && npm run build`
+- **Start Command**: `npm run start:prod`
+- **Instance Type / Plan**: **`Free`**
+- **Health Check Path**: `/health` (Under Advanced $\rightarrow$ Health Check Path).
+
+### Step 3: Enter Environment Variables
+In the **Environment Variables** section, enter:
+
+| Variable Name | Value | Purpose |
 | :--- | :--- | :--- |
-| `NODE_ENV` | `production` | Production Node.js runtime flag. |
-| `STATE_DIR` | `/var/data` | Render Persistent Disk mount path for `bot_state.json`. |
-| `EXN_IS_DEMO` | `true` | **`true`** for your initial 5–6 days of Demo testing. |
-| `EXN_API_KEY` | `exnsk-your_api_key_here` | Your Exness API key. |
-| `EXN_PRIVATE_KEY` | `your_128_hex_key_or_pem` | Your Ed25519 128-hex private key or PKCS#8 PEM string. |
-| `EXN_ACCOUNT_ID` | `your_demo_account_number` | Your $10 Exness Demo account number. |
+| `NODE_ENV` | `production` | Production runtime. |
+| `EXN_IS_DEMO` | `true` | `true` for Demo; `false` for Live. |
+| `EXN_ACCOUNT_ID` | `your_demo_account` | Your Exness Demo account number. |
+| `EXN_API_KEY` | `exnsk-your_api_key` | Your Exness API key. |
+| `EXN_PRIVATE_KEY` | `your_128_hex_key` | Your Ed25519 128-hex private key or PKCS#8 PEM string. |
 | `EXN_GATEWAY_HOST` | `https://api.exness-api.com` | Gateway host from your Exness API Key Management DNS widget. |
-| `EXN_DISCOVERY_BASE_URL` | `https://api.exness-api.com` | Alias for gateway host. |
-| `MAX_RISK_USD` | `1.00` | Maximum intended risk ceiling ($1.00 USD). |
-| `POLL_INTERVAL_MS` | `60000` | Scanner loop interval in milliseconds (60,000 = 60s). |
-| `EXN_DRY_RUN` | `false` | Real execution mode (`false`). |
+| `MAX_RISK_USD` | `1.00` | Max intended risk per trade ($1.00 USD). |
+| `POLL_INTERVAL_MS` | `60000` | Scanner cycle interval (60 seconds). |
+| `EXN_DRY_RUN` | `false` | Real broker execution. |
+
+Click **Create Web Service**. Render will build and deploy the service.
 
 ---
 
-## 7. How to Switch from Demo to Live (After 5–6 Days)
+## 5. Keeping Render Free Web Service Awake 24/7
 
-**No code rebuild or development work is required to switch to Live.**
+Render's Free Web Services spin down into sleep mode if they do not receive inbound HTTP traffic for 15 minutes.
+
+To keep the bot active and scanning continuously 24/7 during market hours:
+1. Copy your deployed Render public URL:
+   `https://<your-service-name>.onrender.com/health`
+2. Create a free monitor at [UptimeRobot](https://uptimerobot.com/) or [cron-job.org](https://cron-job.org/):
+   - **Monitor Type**: HTTP(s)
+   - **URL**: `https://<your-service-name>.onrender.com/health`
+   - **Monitoring Interval**: Every 5 or 10 minutes.
+3. Every ping receives an HTTP 200 response, keeping your free Render container awake and trading non-stop!
+
+---
+
+## 6. How to Switch from Demo to Live (After 5–6 Days)
+
+**No code rebuild or development work is required.**
 
 When you finish your 5–6 days of Demo testing:
-
 1. Open your **Render Dashboard** $\rightarrow$ select `gbpjpy-trend-sweep`.
 2. Go to the **Environment** tab.
 3. Update only these variables:
-   - **`EXN_IS_DEMO`**: Change from `true` to `false`.
-   - **`EXN_ACCOUNT_ID`**: Change to your real Exness Live account number.
-   - **`EXN_API_KEY`** & **`EXN_PRIVATE_KEY`**: Set to your Live Exness API credentials (if different from Demo).
-   - **`EXN_GATEWAY_HOST`**: Set to your Live Gateway host (if different from Demo).
+   - **`EXN_IS_DEMO`**: Change from `true` to **`false`**.
+   - **`EXN_ACCOUNT_ID`**: Change to your **real Exness Live account number**.
+   - **`EXN_API_KEY`** & **`EXN_PRIVATE_KEY`**: Set to your Live Exness API credentials.
+   - **`EXN_GATEWAY_HOST`**: Set to your Live Gateway host (from your Live DNS widget).
 4. Click **Save Changes**.
 
-Render will automatically restart the worker. The bot will connect directly to your Live Exness account using the identical strategy, sizing, and risk rules, and will continue storing state on the persistent disk.
+Render will automatically restart the Web Service. The bot will wake up, discover the Live Access Point, connect to your Live Exness account, and manage real capital with the exact same strategy and risk logic.
 
 ---
 
-## 8. Local Testing & Verification
+## 7. Local Testing & Verification
 
 Run all test suites locally:
 
 ```bash
-# Run all 53 automated verification tests
+# Run all 62 automated verification tests
 npm test
 
 # Run individual suites
-npm run test:strategy      # Strategy logic & zero-lookahead
-npm run test:risk          # Dynamic position sizing & lower R:R scaling
-npm run test:broker        # Exness RFC 8032 Ed25519 signing
-npm run test:integration   # Crash recovery, deduplication, & lifecycle
+npm run test:strategy      # Strategy logic & zero-lookahead (14 tests)
+npm run test:risk          # Dynamic position sizing & lower R:R scaling (13 tests)
+npm run test:broker        # Exness RFC 8032 Ed25519 signing (6 tests)
+npm run test:integration   # Crash recovery, deduplication, & lifecycle (20 tests)
+npm run test:health        # Minimal HTTP health endpoint & shutdown (9 tests)
 ```

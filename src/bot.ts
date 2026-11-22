@@ -13,20 +13,25 @@
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
+import http from "node:http";
 import { ExnessClient } from "./broker/exnessClient.js";
 import { StateManager, ManagedTradeState } from "./state/stateManager.js";
 import { evaluateGbpJpyTrendSweep, Candle } from "./strategy/trendSweep.js";
 import { calculateGbpJpyPositionSize } from "./risk/positionSizer.js";
+import { startHealthServer, BotHealthStatus, HealthStatusProvider } from "./healthServer.js";
 
 // Configuration options from environment
 const CHECK_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "60000", 10);
 const MAX_RISK_USD = parseFloat(process.env.MAX_RISK_USD || "1.00");
 
-export class GbpJpyBot {
+export class GbpJpyBot implements HealthStatusProvider {
   private exness: ExnessClient;
   private state: StateManager;
   private isRunning = false;
   private timer: NodeJS.Timeout | null = null;
+  private httpServer: http.Server | null = null;
+  private startTime = Date.now();
+  private lastHeartbeat = new Date().toISOString();
 
   constructor() {
     this.exness = new ExnessClient();
@@ -35,6 +40,9 @@ export class GbpJpyBot {
 
   public async start(): Promise<void> {
     this.isRunning = true;
+    this.startTime = Date.now();
+    this.lastHeartbeat = new Date().toISOString();
+
     console.log("═══════════════════════════════════════════════════════════════");
     console.log("  GBP/JPY TREND SWEEP AUTOMATED TRADING BOT");
     console.log("  Preserved Original Strategy · Exness Direct API v1.0.2");
@@ -46,6 +54,10 @@ export class GbpJpyBot {
     console.log(`  Max Intended Risk:   $${MAX_RISK_USD.toFixed(2)} USD per trade`);
     console.log(`  Poll Interval:       ${CHECK_INTERVAL_MS / 1000}s`);
     console.log("═══════════════════════════════════════════════════════════════\n");
+
+    // Start lightweight HTTP health server on 0.0.0.0:PORT (Render Web Service)
+    const port = process.env.PORT || 10000;
+    this.httpServer = startHealthServer(port, this);
 
     // Initial account verification
     try {
@@ -74,8 +86,28 @@ export class GbpJpyBot {
       clearInterval(this.timer);
       this.timer = null;
     }
+    if (this.httpServer) {
+      this.httpServer.close();
+      this.httpServer = null;
+    }
     this.state.saveState();
-    console.log("[BOT] Bot stopped gracefully. State saved.");
+    console.log("[BOT] Bot and health server stopped gracefully. State saved.");
+  }
+
+  public getHealthStatus(): BotHealthStatus {
+    const active = this.state.getActiveTrade();
+    return {
+      status: this.isRunning ? "healthy" : "stopped",
+      service: "gbpjpy-trend-sweep",
+      pair: "GBP/JPY",
+      mode: this.exness.isDemoAccount() ? "demo" : "live",
+      executionEngine: this.exness.isSimulated() ? "simulation" : "exness-rest-api",
+      uptimeSeconds: Math.floor((Date.now() - this.startTime) / 1000),
+      activeTrade: active !== null,
+      activeTradeId: active?.tradeId || null,
+      lastHeartbeat: this.lastHeartbeat,
+      timestamp: new Date().toISOString(),
+    };
   }
 
   /** Single evaluation and execution cycle */
@@ -84,6 +116,7 @@ export class GbpJpyBot {
 
     try {
       const now = new Date();
+      this.lastHeartbeat = now.toISOString();
       const utcHour = now.getUTCHours() + now.getUTCMinutes() / 60;
       const dow = now.getUTCDay();
 
@@ -94,7 +127,43 @@ export class GbpJpyBot {
       }
 
       // 1. Manage Active Open Trade (Top Priority)
-      const active = this.state.getActiveTrade();
+      let active = this.state.getActiveTrade();
+
+      // If no local state found (e.g. after container redeploy on Render Free plan), reconcile with Exness
+      if (!active && !this.exness.isSimulated()) {
+        try {
+          const brokerPositions = await this.exness.getOpenPositions();
+          const gbpPos = brokerPositions.find((p) => p.instrument === "GBPJPY");
+          if (gbpPos) {
+            console.log(`[RECONCILE] Recovered active GBP/JPY position from Exness broker: ${gbpPos.positionId} (${gbpPos.direction} ${gbpPos.volume} lots @ ${gbpPos.openPrice})`);
+            const slDist = Math.abs(gbpPos.openPrice - (gbpPos.sl || (gbpPos.direction === "BUY" ? gbpPos.openPrice - 0.30 : gbpPos.openPrice + 0.30)));
+            const reconstructed: ManagedTradeState = {
+              tradeId: `ts_broker_${gbpPos.positionId}`,
+              brokerPositionId: gbpPos.positionId,
+              pair: "GBP/JPY",
+              direction: gbpPos.direction,
+              entryPrice: gbpPos.openPrice,
+              initialSl: gbpPos.sl || (gbpPos.direction === "BUY" ? gbpPos.openPrice - 0.30 : gbpPos.openPrice + 0.30),
+              currentSl: gbpPos.sl || (gbpPos.direction === "BUY" ? gbpPos.openPrice - 0.30 : gbpPos.openPrice + 0.30),
+              tp1: gbpPos.tp || (gbpPos.direction === "BUY" ? gbpPos.openPrice + slDist : gbpPos.openPrice - slDist),
+              tp2: gbpPos.direction === "BUY" ? Number((gbpPos.openPrice + slDist * 2.5).toFixed(3)) : Number((gbpPos.openPrice - slDist * 2.5).toFixed(3)),
+              riskDistance: slDist > 0 ? slDist : 0.30,
+              volume: gbpPos.volume,
+              remainingVolume: gbpPos.volume,
+              tp1Hit: false,
+              beActive: Boolean(gbpPos.sl && Math.abs(gbpPos.sl - gbpPos.openPrice) < 0.05),
+              openedAt: gbpPos.createTime || new Date().toISOString(),
+              candleBarTime: new Date().toISOString(),
+              dollarRisk: MAX_RISK_USD,
+            };
+            this.state.recordTradeOpen(reconstructed);
+            active = reconstructed;
+          }
+        } catch (e: any) {
+          console.warn(`[RECONCILE] Broker position check warning: ${e.message}`);
+        }
+      }
+
       if (active) {
         await this.manageActiveTrade(active);
         return; // While in a trade, do not evaluate new entries
@@ -212,6 +281,17 @@ export class GbpJpyBot {
           : (t.entryPrice - currentPrice) / risk;
 
       console.log(`[MANAGE] ${t.pair} ${t.direction} @ ${t.entryPrice} | Cur: ${currentPrice} | Progress: ${progressR >= 0 ? "+" : ""}${progressR.toFixed(2)}R | SL: ${t.currentSl} | TP1 Hit: ${t.tp1Hit}`);
+
+      // Check if position was closed externally by broker (e.g. SL or TP filled while bot was sleeping)
+      if (!this.exness.isSimulated()) {
+        const openPos = await this.exness.getOpenPositions().catch(() => null);
+        if (openPos && !openPos.some((p) => p.positionId === t.brokerPositionId)) {
+          console.log(`[MANAGE] Broker position ${t.brokerPositionId} was closed externally by Exness (SL/TP executed). Reconciling state.`);
+          const realizedR = progressR >= 0.8 ? 1.0 : (progressR <= -0.8 ? -1.0 : Number(progressR.toFixed(2)));
+          this.state.recordTradeClose(currentPrice, realizedR, realizedR * t.dollarRisk, realizedR > 0 ? "TP1_TP2" : "SL");
+          return;
+        }
+      }
 
       // 1. Stage 1: Target 1 (1.00R) -> Close 50% & Move SL to Breakeven
       const tp1Triggered =

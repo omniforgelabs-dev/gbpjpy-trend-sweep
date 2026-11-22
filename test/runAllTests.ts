@@ -10,6 +10,7 @@ const suites = [
   "test/positionSizer.test.ts",
   "test/exnessClient.test.ts",
   "test/botIntegration.test.ts",
+  "test/healthServer.test.ts",
 ];
 
 let totalPassed = true;

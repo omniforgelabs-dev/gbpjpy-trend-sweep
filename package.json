@@ -12,7 +12,8 @@
     "test:strategy": "tsx test/trendSweep.test.ts",
     "test:risk": "tsx test/positionSizer.test.ts",
     "test:broker": "tsx test/exnessClient.test.ts",
-    "test:integration": "tsx test/botIntegration.test.ts"
+    "test:integration": "tsx test/botIntegration.test.ts",
+    "test:health": "tsx test/healthServer.test.ts"
   },
   "keywords": [
     "trading-bot",
