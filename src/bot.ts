@@ -41,6 +41,8 @@ export class GbpJpyBot {
     console.log("═══════════════════════════════════════════════════════════════");
     console.log(`  Environment Mode:    ${this.exness.isDemoAccount() ? "DEMO (Testing)" : "LIVE REAL ACCOUNT"}`);
     console.log(`  Execution Engine:    ${this.exness.isSimulated() ? "SANDBOX SIMULATION" : "EXNESS DIRECT REST API"}`);
+    console.log(`  Gateway Host:        ${this.exness.getConfiguredGatewayHost()}`);
+    console.log(`  State Mount File:    ${this.state.getFilePath()}`);
     console.log(`  Max Intended Risk:   $${MAX_RISK_USD.toFixed(2)} USD per trade`);
     console.log(`  Poll Interval:       ${CHECK_INTERVAL_MS / 1000}s`);
     console.log("═══════════════════════════════════════════════════════════════\n");

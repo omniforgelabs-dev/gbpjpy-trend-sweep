@@ -19,7 +19,9 @@ export interface ExnessClientConfig {
   apiKey: string;
   privateKey: string;
   accountId: string;
-  discoveryBaseUrl: string;
+  gatewayHost: string;
+  discoveryBaseUrl?: string;
+  accessPointUrl?: string;
   isDemo: boolean;
   dryRun?: boolean;
 }
@@ -118,14 +120,25 @@ export class ExnessClient {
   private simPositions: Map<string, ExnessPositionItem> = new Map();
 
   constructor(config: Partial<ExnessClientConfig> = {}) {
+    const rawGateway =
+      config.gatewayHost ||
+      process.env.EXN_GATEWAY_HOST ||
+      config.discoveryBaseUrl ||
+      process.env.EXN_DISCOVERY_BASE_URL ||
+      "https://api.exness-api.com";
+
+    const rawAccessPoint =
+      config.accessPointUrl ||
+      process.env.EXN_ACCESS_POINT_URL ||
+      "";
+
     this.config = {
       apiKey: config.apiKey || process.env.EXN_API_KEY || "",
       privateKey: config.privateKey || process.env.EXN_PRIVATE_KEY || "",
       accountId: config.accountId || process.env.EXN_ACCOUNT_ID || "",
-      discoveryBaseUrl:
-        config.discoveryBaseUrl ||
-        process.env.EXN_DISCOVERY_BASE_URL ||
-        "https://gateway.exness.com",
+      gatewayHost: this.normalizeUrl(rawGateway),
+      discoveryBaseUrl: this.normalizeUrl(rawGateway),
+      accessPointUrl: rawAccessPoint ? this.normalizeUrl(rawAccessPoint) : undefined,
       isDemo: config.isDemo !== undefined ? config.isDemo : process.env.EXN_IS_DEMO !== "false",
       dryRun: config.dryRun !== undefined ? config.dryRun : process.env.EXN_DRY_RUN === "true",
     };
@@ -146,6 +159,22 @@ export class ExnessClient {
         this.isSimulationMode = true;
       }
     }
+  }
+
+  public normalizeUrl(url: string): string {
+    let u = url.trim().replace(/\/+$/, "");
+    if (!/^https?:\/\//i.test(u)) {
+      u = `https://${u}`;
+    }
+    return u;
+  }
+
+  public getConfiguredGatewayHost(): string {
+    return this.config.gatewayHost;
+  }
+
+  public getResolvedAccessPoint(): string | null {
+    return this.accessPointUrl;
   }
 
   public isSimulated(): boolean {
@@ -197,35 +226,66 @@ export class ExnessClient {
     };
   }
 
-  /** Discovers and caches the specific trading server access point */
-  private async getTradingBaseUrl(): Promise<string> {
+  /**
+   * Resolves and caches the account-specific Access Point from the Gateway host.
+   * Accepts the actual Gateway host from Exness API Key Management DNS widget,
+   * queries GET /v1/trading/access-point?account_id=<ID>, and falls back seamlessly if needed.
+   */
+  public async getTradingBaseUrl(forceRefresh = false): Promise<string> {
     if (this.isSimulationMode) return "https://simulated.exness.local";
+
+    // Direct override if user provided EXN_ACCESS_POINT_URL directly
+    if (this.config.accessPointUrl) {
+      return this.config.accessPointUrl;
+    }
+
     const now = Date.now();
-    if (this.accessPointUrl && now - this.accessPointCachedAt < 1800000) {
+    // Cache Access Point for 60 minutes
+    if (!forceRefresh && this.accessPointUrl && now - this.accessPointCachedAt < 3600000) {
       return this.accessPointUrl;
     }
 
     const path = `/v1/trading/access-point?account_id=${this.config.accountId}`;
-    const url = `${this.config.discoveryBaseUrl}${path}`;
-    const headers = this.getSignedHeaders("GET", path);
 
-    try {
-      const resp = await fetch(url, { method: "GET", headers });
-      if (!resp.ok) {
-        throw new Error(`Discovery failed with status ${resp.status}`);
+    // Candidate Gateway hosts: User-configured gateway host first, then known live gateways
+    const candidates = [
+      this.config.gatewayHost,
+      "https://api.exness-api.com",
+      "https://api.exness.com",
+      "https://gateway.exness.com",
+    ].filter(Boolean).map((h) => this.normalizeUrl(h));
+
+    const uniqueCandidates = Array.from(new Set(candidates));
+
+    for (const gateway of uniqueCandidates) {
+      try {
+        const url = `${gateway}${path}`;
+        const headers = this.getSignedHeaders("GET", path);
+
+        const resp = await fetch(url, { method: "GET", headers });
+        if (resp.ok) {
+          const data: any = await resp.json();
+          const endpoint = data.access_point || data.accessPoint || data.endpoint || data.url || data.data?.access_point;
+          if (endpoint && typeof endpoint === "string") {
+            this.accessPointUrl = this.normalizeUrl(endpoint);
+            this.accessPointCachedAt = now;
+            console.log(`[EXNESS] Account-specific Access Point discovered: ${this.accessPointUrl} (via Gateway: ${gateway})`);
+            return this.accessPointUrl;
+          }
+        } else {
+          console.warn(`[EXNESS] Gateway ${gateway} returned status ${resp.status} for access-point discovery.`);
+        }
+      } catch (err: any) {
+        // Continue to next candidate
       }
-      const data: any = await resp.json();
-      const endpoint = data.access_point || data.endpoint || data.url;
-      if (endpoint) {
-        this.accessPointUrl = endpoint.replace(/\/+$/, "");
-        this.accessPointCachedAt = now;
-        return this.accessPointUrl!;
-      }
-    } catch (e: any) {
-      // Fallback to direct api.exness-api.com
-      return "https://api.exness-api.com";
     }
-    return "https://api.exness-api.com";
+
+    // Default fallback to api.exness-api.com
+    const fallback = this.config.gatewayHost || "https://api.exness-api.com";
+    this.accessPointUrl = this.normalizeUrl(fallback);
+    this.accessPointCachedAt = now;
+    console.warn(`[EXNESS] Access Point discovery exhausted candidates. Using fallback trading endpoint: ${this.accessPointUrl}`);
+    return this.accessPointUrl;
   }
 
   /** Fetches current account equity and balance */

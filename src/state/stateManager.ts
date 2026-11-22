@@ -58,8 +58,24 @@ export class StateManager {
   private state: BotState;
 
   constructor(customPath?: string) {
-    this.filePath = customPath || path.join(process.cwd(), "data", "bot_state.json");
+    const envFile = process.env.STATE_FILE_PATH;
+    const envDir = process.env.STATE_DIR;
+
+    if (customPath) {
+      this.filePath = customPath;
+    } else if (envFile) {
+      this.filePath = envFile;
+    } else if (envDir) {
+      this.filePath = path.join(envDir, "bot_state.json");
+    } else {
+      this.filePath = path.join(process.cwd(), "data", "bot_state.json");
+    }
+
     this.state = this.loadState();
+  }
+
+  public getFilePath(): string {
+    return this.filePath;
   }
 
   /** Loads state from disk or initializes defaults */

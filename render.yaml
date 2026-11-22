@@ -3,15 +3,23 @@ services:
     name: gbpjpy-trend-sweep
     runtime: node
     plan: starter
+    disk:
+      name: gbpjpy-state
+      mountPath: /var/data
+      sizeGB: 1
     buildCommand: npm install && npm run build
     startCommand: npm run start:prod
     envVars:
       - key: NODE_ENV
         value: production
+      - key: STATE_DIR
+        value: /var/data
       - key: EXN_IS_DEMO
         value: "true"
+      - key: EXN_GATEWAY_HOST
+        value: "https://api.exness-api.com"
       - key: EXN_DISCOVERY_BASE_URL
-        value: "https://gateway.exness.com"
+        value: "https://api.exness-api.com"
       - key: MAX_RISK_USD
         value: "1.00"
       - key: POLL_INTERVAL_MS

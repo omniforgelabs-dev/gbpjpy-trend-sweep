@@ -2,7 +2,7 @@
 
 A completely independent, lightweight, headless automated trading bot for **GBP/JPY** running the original **Trend-Following Liquidity Sweep with Momentum Rejection (Trend Sweep 🌊, Option A)** strategy recovered from the APEX quant research archive.
 
-Directly integrated with the **Exness Trading API v1.0.2** using native RFC 8032 Ed25519 request signing. Designed for deployment as a 24/7 background worker on **Render**.
+Directly integrated with the **Exness Trading API v1.0.2** using native RFC 8032 Ed25519 request signing. Designed for deployment as a 24/7 background worker on **Render** with persistent state recovery across reboots.
 
 ---
 
@@ -42,44 +42,42 @@ This bot executes the exact zero-lookahead specification recovered from `trendSw
 
 ---
 
-## 3. Project Architecture
+## 3. Render Persistent Disk & Crash Recovery
 
-```
-gbpjpy-trend-sweep/
-├── src/
-│   ├── strategy/
-│   │   └── trendSweep.ts       # Original zero-lookahead Trend Sweep engine
-│   ├── broker/
-│   │   └── exnessClient.ts     # Exness Trading API v1.0.2 direct client (Ed25519 signing)
-│   ├── risk/
-│   │   └── positionSizer.ts    # Dynamic lot sizer ($1.00 max risk, JPY conversion)
-│   ├── state/
-│   │   └── stateManager.ts     # Crash-resistant atomic disk persistence & deduplication
-│   └── bot.ts                  # Autonomous headless daemon & trade lifecycle manager
-├── test/
-│   ├── trendSweep.test.ts      # Strategy unit tests & historical data replay
-│   ├── positionSizer.test.ts   # Position sizing & lower R:R scaling tests
-│   ├── exnessClient.test.ts    # RFC 8032 Ed25519 signature test vector verification
-│   ├── botIntegration.test.ts  # Restart recovery, deduplication, & lifecycle tests
-│   └── runAllTests.ts          # Unified test runner (53/53 tests passing)
-├── render.yaml                 # Render Blueprint configuration
-├── Dockerfile                  # Lightweight Node.js 20 Alpine container
-├── package.json
-├── tsconfig.json
-├── .env.example
-└── README.md
-```
+Render background workers run on an ephemeral filesystem by default (local files are cleared on redeploy or service reboot).
+
+To guarantee that active trade recovery (`tp1Hit`, `currentSl`, Breakeven, open tickets, deduplication records) survives restarts and redeployments, this project is pre-configured to use a **Render Persistent Disk**:
+
+- **Disk Name**: `gbpjpy-state`
+- **Mount Path**: `/var/data`
+- **Size**: `1 GB` (standard minimum, ample for hundreds of thousands of state records)
+- **Environment Variable**: `STATE_DIR=/var/data` (routes `bot_state.json` directly onto the mounted persistent disk).
+- **Fallback**: When run locally without a mounted disk, it automatically saves to `./data/bot_state.json`.
 
 ---
 
-## 4. Render Deployment Instructions (Background Worker)
+## 4. Exness Discovery & Gateway Host Configuration
+
+Exness does not use a single static trading server. Instead:
+1. In your **Exness Personal Area** $\rightarrow$ **Settings** $\rightarrow$ **API** $\rightarrow$ **API Key Management**, your account displays an assigned **Gateway Host / DNS Widget** (e.g., `https://api.exness-api.com` or custom gateway).
+2. Enter that hostname into the `EXN_GATEWAY_HOST` environment variable.
+3. On startup, the bot queries `GET /v1/trading/access-point?account_id=<ACCOUNT_ID>` with signed Ed25519 headers against your gateway host to automatically discover your account's dedicated trading **Access Point** (e.g., `https://trade-fra.exness.com`).
+4. If discovery ever encounters a temporary DNS or gateway timeout, the bot automatically falls back through standard Exness gateways (`https://api.exness-api.com`, `https://api.exness.com`) and logs the resolved endpoint in your Render console.
+5. If Exness ever provides a direct Access Point URL, you can optionally override discovery entirely with `EXN_ACCESS_POINT_URL`.
+
+---
+
+## 5. Render Deployment Instructions (Background Worker)
 
 ### Option A: 1-Click Blueprint Deploy (Recommended)
 
 1. Push this repository to GitHub: `https://github.com/<your-username>/gbpjpy-trend-sweep`.
 2. Log into [Render Dashboard](https://dashboard.render.com/).
 3. Click **New +** $\rightarrow$ **Blueprint**.
-4. Connect the `gbpjpy-trend-sweep` repository. Render will automatically read `render.yaml`.
+4. Connect the `gbpjpy-trend-sweep` repository. Render reads `render.yaml` and will automatically configure:
+   - Worker runtime: Node
+   - Build & Start commands
+   - Persistent Disk (`gbpjpy-state` mounted at `/var/data`)
 5. Enter your Exness API credentials under Environment Variables and deploy!
 
 ### Option B: Manual Background Worker Setup
@@ -93,30 +91,38 @@ gbpjpy-trend-sweep/
    - **Runtime**: `Node`
    - **Build Command**: `npm install && npm run build`
    - **Start Command**: `npm run start:prod`
-   - **Plan**: `Starter` (or higher for 24/7 persistent execution)
-4. Add the **Environment Variables** (see table below).
-5. Click **Create Background Worker**.
+   - **Plan**: `Starter` (guarantees continuous 24/7 background execution without idle spin-down).
+4. Attach a **Persistent Disk**:
+   - Scroll down to **Disks** $\rightarrow$ click **Add Disk**.
+   - **Name**: `gbpjpy-state`
+   - **Mount Path**: `/var/data`
+   - **Size**: `1 GB`
+5. Add the **Environment Variables** (see table below).
+6. Click **Create Background Worker**.
 
 ---
 
-## 5. Required Environment Variables
+## 6. Required Environment Variables
 
 Configure these in **Render Dashboard** $\rightarrow$ **Service** $\rightarrow$ **Environment**:
 
-| Variable Name | Example / Default | Description |
+| Variable Name | Recommended Initial Value | Description |
 | :--- | :--- | :--- |
-| `EXN_API_KEY` | `exnsk-your_api_key_here` | Your Exness Trading API Key. |
+| `NODE_ENV` | `production` | Production Node.js runtime flag. |
+| `STATE_DIR` | `/var/data` | Render Persistent Disk mount path for `bot_state.json`. |
+| `EXN_IS_DEMO` | `true` | **`true`** for your initial 5–6 days of Demo testing. |
+| `EXN_API_KEY` | `exnsk-your_api_key_here` | Your Exness API key. |
 | `EXN_PRIVATE_KEY` | `your_128_hex_key_or_pem` | Your Ed25519 128-hex private key or PKCS#8 PEM string. |
-| `EXN_ACCOUNT_ID` | `12345678` | Your Exness Demo or Live Account Number. |
-| `EXN_DISCOVERY_BASE_URL` | `https://gateway.exness.com` | Exness API Gateway Access Point discovery URL. |
-| `EXN_IS_DEMO` | `true` | Set to `true` for Demo; set to `false` for Live. |
-| `MAX_RISK_USD` | `1.00` | Maximum intended risk per trade in USD (e.g., $1.00 for $10 balance). |
+| `EXN_ACCOUNT_ID` | `your_demo_account_number` | Your $10 Exness Demo account number. |
+| `EXN_GATEWAY_HOST` | `https://api.exness-api.com` | Gateway host from your Exness API Key Management DNS widget. |
+| `EXN_DISCOVERY_BASE_URL` | `https://api.exness-api.com` | Alias for gateway host. |
+| `MAX_RISK_USD` | `1.00` | Maximum intended risk ceiling ($1.00 USD). |
 | `POLL_INTERVAL_MS` | `60000` | Scanner loop interval in milliseconds (60,000 = 60s). |
-| `EXN_DRY_RUN` | `false` | Set to `true` for local sandbox simulation without placing broker orders. |
+| `EXN_DRY_RUN` | `false` | Real execution mode (`false`). |
 
 ---
 
-## 6. How to Switch from Demo to Live (After 5–6 Days)
+## 7. How to Switch from Demo to Live (After 5–6 Days)
 
 **No code rebuild or development work is required to switch to Live.**
 
@@ -128,13 +134,14 @@ When you finish your 5–6 days of Demo testing:
    - **`EXN_IS_DEMO`**: Change from `true` to `false`.
    - **`EXN_ACCOUNT_ID`**: Change to your real Exness Live account number.
    - **`EXN_API_KEY`** & **`EXN_PRIVATE_KEY`**: Set to your Live Exness API credentials (if different from Demo).
+   - **`EXN_GATEWAY_HOST`**: Set to your Live Gateway host (if different from Demo).
 4. Click **Save Changes**.
 
-Render will automatically restart the worker. The bot will connect directly to your Live Exness account using the identical strategy, sizing, and risk rules.
+Render will automatically restart the worker. The bot will connect directly to your Live Exness account using the identical strategy, sizing, and risk rules, and will continue storing state on the persistent disk.
 
 ---
 
-## 7. Local Testing & Verification
+## 8. Local Testing & Verification
 
 Run all test suites locally:
 
