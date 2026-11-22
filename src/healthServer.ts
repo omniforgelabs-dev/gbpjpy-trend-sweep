@@ -14,7 +14,7 @@
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
-import http from "node:http";
+import http, { type IncomingMessage, type ServerResponse } from "node:http";
 
 export interface BotHealthStatus {
   status: "healthy" | "starting" | "stopped";
@@ -45,7 +45,7 @@ export function startHealthServer(
 ): http.Server {
   const listenPort = typeof port === "string" ? parseInt(port, 10) : port;
 
-  const server = http.createServer((req, res) => {
+  const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
     const rawPath = (req.url || "").split("?")[0];
     const normalizedPath = rawPath.replace(/\/+$/, "") || "/";
 
