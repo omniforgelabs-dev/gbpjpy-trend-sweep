@@ -137,6 +137,7 @@ export class GbpJpyBot implements HealthStatusProvider {
           if (gbpPos) {
             console.log(`[RECONCILE] Recovered active GBP/JPY position from Exness broker: ${gbpPos.positionId} (${gbpPos.direction} ${gbpPos.volume} lots @ ${gbpPos.openPrice})`);
             const slDist = Math.abs(gbpPos.openPrice - (gbpPos.sl || (gbpPos.direction === "BUY" ? gbpPos.openPrice - 0.30 : gbpPos.openPrice + 0.30)));
+            const isBe = Boolean(gbpPos.sl && Math.abs(gbpPos.sl - gbpPos.openPrice) < 0.05);
             const reconstructed: ManagedTradeState = {
               tradeId: `ts_broker_${gbpPos.positionId}`,
               brokerPositionId: gbpPos.positionId,
@@ -150,11 +151,12 @@ export class GbpJpyBot implements HealthStatusProvider {
               riskDistance: slDist > 0 ? slDist : 0.30,
               volume: gbpPos.volume,
               remainingVolume: gbpPos.volume,
-              tp1Hit: false,
-              beActive: Boolean(gbpPos.sl && Math.abs(gbpPos.sl - gbpPos.openPrice) < 0.05),
+              tp1Hit: isBe,
+              beActive: isBe,
               openedAt: gbpPos.createTime || new Date().toISOString(),
               candleBarTime: new Date().toISOString(),
               dollarRisk: MAX_RISK_USD,
+              sltpOrderId: gbpPos.sltpOrderId,
             };
             this.state.recordTradeOpen(reconstructed);
             active = reconstructed;
@@ -307,7 +309,7 @@ export class GbpJpyBot implements HealthStatusProvider {
         // Close 50% on broker
         await this.exness.closePosition(t.brokerPositionId, halfVolume).catch(() => {});
         // Move SL to Breakeven (entry price)
-        await this.exness.modifyPositionSl(t.brokerPositionId, t.entryPrice).catch(() => {});
+        await this.exness.modifyPositionSl(t.brokerPositionId, t.entryPrice, t.sltpOrderId).catch(() => {});
 
         this.state.recordTp1Hit(t.entryPrice, remVolume);
         console.log(`[TP1 APPLIED] SL moved to BE (${t.entryPrice}). Remaining volume: ${remVolume} lots.`);

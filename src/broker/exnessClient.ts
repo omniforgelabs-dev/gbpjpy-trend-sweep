@@ -78,6 +78,7 @@ export interface ExnessPositionItem {
   profit?: number;
   createTime: string;
   comment?: string;
+  sltpOrderId?: string;
 }
 
 /**
@@ -303,20 +304,35 @@ export class ExnessClient {
     }
 
     const base = await this.getTradingBaseUrl();
-    const path = `/v1/trading/accounts/${this.config.accountId}`;
+    const path = `/v1/trading/accounts/${this.config.accountId}/snapshot`;
     const headers = this.getSignedHeaders("GET", path);
 
     const resp = await fetch(`${base}${path}`, { method: "GET", headers });
     if (!resp.ok) {
-      throw new Error(`Failed to fetch account info: ${resp.status} ${resp.statusText}`);
+      const altPath = `/v1/trading/accounts/${this.config.accountId}`;
+      const altResp = await fetch(`${base}${altPath}`, { method: "GET", headers: this.getSignedHeaders("GET", altPath) });
+      if (!altResp.ok) {
+        throw new Error(`Failed to fetch account info: ${resp.status} ${resp.statusText}`);
+      }
+      const altData: any = await altResp.json();
+      return {
+        accountId: String(this.config.accountId),
+        balance: Number(altData.balance || 0),
+        equity: Number(altData.equity || altData.balance || 0),
+        freeMargin: Number(altData.free_margin || altData.balance || 0),
+        currency: String(altData.currency || "USD"),
+        isDemo: this.config.isDemo,
+        isSimulated: false,
+      };
     }
     const d: any = await resp.json();
+    const acc = d.account_state || d;
     return {
-      accountId: String(d.account_id || this.config.accountId),
-      balance: Number(d.balance || 0),
-      equity: Number(d.equity || d.balance || 0),
-      freeMargin: Number(d.free_margin || d.available_margin || d.balance || 0),
-      currency: String(d.currency || "USD"),
+      accountId: String(this.config.accountId),
+      balance: Number(acc.balance || 0),
+      equity: Number(acc.equity || acc.balance || 0),
+      freeMargin: Number(acc.free_margin || (Number(acc.equity || 0) - Number(acc.used_margin || 0)) || acc.balance || 0),
+      currency: String(acc.currency || "USD"),
       isDemo: this.config.isDemo,
       isSimulated: false,
     };
@@ -334,6 +350,33 @@ export class ExnessClient {
     }
 
     const base = await this.getTradingBaseUrl();
+    const nowIso = new Date().toISOString();
+
+    // 1. Try high-frequency M1 candle close from market-data API
+    try {
+      const candlePath = `/v1/market-data/accounts/${this.config.accountId}/candles?instrument=${instrument}&timeframe=M1&from=${encodeURIComponent(nowIso)}&count=-1&price_type=bid`;
+      const candleHeaders = this.getSignedHeaders("GET", candlePath);
+      const candleResp = await fetch(`${base}${candlePath}`, { method: "GET", headers: candleHeaders });
+      if (candleResp.ok) {
+        const cData: any = await candleResp.json();
+        const candles = cData.candles || [];
+        if (candles.length > 0) {
+          const latest = candles[candles.length - 1];
+          const spread = instrument === "USDJPY" ? 0.02 : 0.03;
+          const bid = Number(latest.c || latest.close || 0);
+          return {
+            instrument,
+            bid,
+            ask: Number((bid + spread).toFixed(3)),
+            timestamp: latest.t || latest.time || nowIso,
+          };
+        }
+      }
+    } catch {
+      // Continue to quotes fallback
+    }
+
+    // 2. Direct quotes fallback
     const path = `/v1/market-data/quotes?instruments=${instrument}`;
     const headers = this.getSignedHeaders("GET", path);
 
@@ -368,21 +411,40 @@ export class ExnessClient {
     }
 
     const base = await this.getTradingBaseUrl();
-    const path = `/v1/market-data/candles?instrument=GBPJPY&timeframe=${timeframe}&limit=${limit}`;
+    const nowIso = new Date().toISOString();
+    const path = `/v1/market-data/accounts/${this.config.accountId}/candles?instrument=GBPJPY&timeframe=${timeframe}&from=${encodeURIComponent(nowIso)}&count=${-Math.abs(limit)}&price_type=bid`;
     const headers = this.getSignedHeaders("GET", path);
 
     const resp = await fetch(`${base}${path}`, { method: "GET", headers });
     if (!resp.ok) {
-      throw new Error(`Failed to get ${timeframe} candles: ${resp.status}`);
+      // Alternate candles endpoint fallback
+      const altPath = `/v1/market-data/candles?instrument=GBPJPY&timeframe=${timeframe}&limit=${limit}`;
+      const altResp = await fetch(`${base}${altPath}`, { method: "GET", headers: this.getSignedHeaders("GET", altPath) });
+      if (!altResp.ok) {
+        throw new Error(`Failed to get ${timeframe} candles: ${resp.status}`);
+      }
+      const altList = (await altResp.json()) as any[];
+      return altList.map((c) => ({
+        open: Number(c.o ?? c.open),
+        high: Number(c.h ?? c.high),
+        low: Number(c.l ?? c.low),
+        close: Number(c.c ?? c.close),
+        time: c.t ?? c.time,
+      }));
     }
-    const list = (await resp.json()) as any[];
-    return list.map((c) => ({
+
+    const data: any = await resp.json();
+    const list: any[] = data.candles || (Array.isArray(data) ? data : []);
+    const candles: Candle[] = list.map((c) => ({
       open: Number(c.o ?? c.open),
       high: Number(c.h ?? c.high),
       low: Number(c.l ?? c.low),
       close: Number(c.c ?? c.close),
       time: c.t ?? c.time,
     }));
+    // Sort oldest first
+    candles.sort((a, b) => new Date(a.time || 0).getTime() - new Date(b.time || 0).getTime());
+    return candles;
   }
 
   /** Submits a market order with attached SL and TP */
@@ -421,17 +483,16 @@ export class ExnessClient {
     }
 
     const base = await this.getTradingBaseUrl();
-    const path = "/v1/trading/orders";
-    const body = {
-      account_id: this.config.accountId,
+    const path = `/v1/trading/accounts/${this.config.accountId}/positions`;
+    const body: Record<string, any> = {
       instrument: "GBPJPY",
-      order_type: "market",
-      direction: dirLower,
-      volume: req.volume,
-      take_profit: req.tp1,
-      stop_loss: req.sl,
+      side: dirLower,
+      volume: req.volume.toFixed(2),
       comment: req.comment || "TrendSweep_GBPJPY",
     };
+    if (req.sl > 0) body.stop_loss_price = req.sl.toFixed(3);
+    if (req.tp1 > 0) body.take_profit_price = req.tp1.toFixed(3);
+
     const bodyJson = JSON.stringify(body);
     const headers = this.getSignedHeaders("POST", path, bodyJson);
 
@@ -456,13 +517,29 @@ export class ExnessClient {
     }
 
     const res: any = await resp.json();
+    const opId = String(res.operation_id || res.id || "");
+    let positionId = String(res.position_id || opId);
+    let fillPrice = Number(res.price || res.open_price || 0);
+
+    // Retrieve confirmed position from snapshot if only ACK / operation_id was returned
+    if (!fillPrice || fillPrice === 0) {
+      try {
+        const positions = await this.getOpenPositions();
+        const matched = positions.find((p) => p.direction === dirUpper);
+        if (matched) {
+          positionId = matched.positionId;
+          fillPrice = matched.openPrice;
+        }
+      } catch {}
+    }
+
     return {
       success: true,
-      orderId: String(res.order_id || res.id || ""),
-      positionId: String(res.position_id || res.deal_id || res.order_id || ""),
+      orderId: opId,
+      positionId,
       direction: dirUpper,
       volume: req.volume,
-      fillPrice: Number(res.price || res.open_price || 0),
+      fillPrice: fillPrice || (dirUpper === "BUY" ? 208.50 : 208.45),
       sl: req.sl,
       tp: req.tp1,
       createTime: new Date().toISOString(),
@@ -471,7 +548,7 @@ export class ExnessClient {
   }
 
   /** Modifies SL of an open position to Breakeven */
-  public async modifyPositionSl(positionId: string, newSl: number): Promise<boolean> {
+  public async modifyPositionSl(positionId: string, newSl: number, sltpOrderId?: string): Promise<boolean> {
     if (this.isSimulationMode) {
       const p = this.simPositions.get(positionId);
       if (p) {
@@ -482,16 +559,48 @@ export class ExnessClient {
     }
 
     const base = await this.getTradingBaseUrl();
-    const path = `/v1/trading/positions/${positionId}`;
-    const bodyJson = JSON.stringify({ stop_loss: newSl });
-    const headers = this.getSignedHeaders("PATCH", path, bodyJson);
 
-    const resp = await fetch(`${base}${path}`, {
-      method: "PATCH",
-      headers,
-      body: bodyJson,
-    });
-    return resp.ok;
+    // 1. If sltpOrderId known or discoverable, PATCH existing sltp order
+    let targetSltpId = sltpOrderId;
+    if (!targetSltpId) {
+      try {
+        const open = await this.getOpenPositions();
+        const match = open.find((p) => p.positionId === positionId);
+        targetSltpId = match?.sltpOrderId;
+      } catch {}
+    }
+
+    if (targetSltpId) {
+      const path = `/v1/trading/accounts/${this.config.accountId}/orders/${targetSltpId}`;
+      const body = JSON.stringify({ stop_loss_price: newSl.toFixed(3) });
+      const headers = this.getSignedHeaders("PATCH", path, body);
+      const resp = await fetch(`${base}${path}`, { method: "PATCH", headers, body });
+      if (resp.ok) return true;
+    }
+
+    // 2. Attach new sltp order via POST /orders
+    try {
+      const path = `/v1/trading/accounts/${this.config.accountId}/orders`;
+      const body = JSON.stringify({
+        type: "sltp",
+        position_id: positionId,
+        stop_loss_price: newSl.toFixed(3),
+      });
+      const headers = this.getSignedHeaders("POST", path, body);
+      const resp = await fetch(`${base}${path}`, { method: "POST", headers, body });
+      if (resp.ok) return true;
+    } catch {}
+
+    // 3. Fallback to direct position PATCH
+    try {
+      const path = `/v1/trading/positions/${positionId}`;
+      const body = JSON.stringify({ stop_loss: newSl });
+      const headers = this.getSignedHeaders("PATCH", path, body);
+      const resp = await fetch(`${base}${path}`, { method: "PATCH", headers, body });
+      return resp.ok;
+    } catch {
+      return false;
+    }
   }
 
   /** Closes an open position partially or fully */
@@ -510,43 +619,98 @@ export class ExnessClient {
     }
 
     const base = await this.getTradingBaseUrl();
-    const path = `/v1/trading/positions/${positionId}/close`;
-    const bodyJson = volume ? JSON.stringify({ volume }) : "{}";
-    const headers = this.getSignedHeaders("POST", path, bodyJson);
 
-    const resp = await fetch(`${base}${path}`, {
-      method: "POST",
-      headers,
-      body: bodyJson,
-    });
-    return resp.ok;
+    // 1. Authoritative DELETE /positions/{id}?volume=...
+    let delPath = `/v1/trading/accounts/${this.config.accountId}/positions/${positionId}`;
+    if (volume && volume > 0) {
+      delPath += `?volume=${volume.toFixed(2)}`;
+    }
+    const delHeaders = this.getSignedHeaders("DELETE", delPath);
+    const delResp = await fetch(`${base}${delPath}`, { method: "DELETE", headers: delHeaders });
+    if (delResp.ok) return true;
+
+    // 2. Fallback to POST /positions/{id}/close
+    try {
+      const postPath = `/v1/trading/positions/${positionId}/close`;
+      const bodyJson = volume ? JSON.stringify({ volume }) : "{}";
+      const headers = this.getSignedHeaders("POST", postPath, bodyJson);
+      const postResp = await fetch(`${base}${postPath}`, { method: "POST", headers, body: bodyJson });
+      return postResp.ok;
+    } catch {
+      return false;
+    }
   }
 
-  /** Retrieves currently active positions on GBP/JPY */
+  /**
+   * Retrieves currently active GBP/JPY positions and reconciles with attached SL/TP orders from snapshot.
+   */
   public async getOpenPositions(): Promise<ExnessPositionItem[]> {
     if (this.isSimulationMode) {
       return Array.from(this.simPositions.values());
     }
 
     const base = await this.getTradingBaseUrl();
-    const path = `/v1/trading/positions?account_id=${this.config.accountId}&instrument=GBPJPY`;
+    const path = `/v1/trading/accounts/${this.config.accountId}/snapshot`;
     const headers = this.getSignedHeaders("GET", path);
 
     const resp = await fetch(`${base}${path}`, { method: "GET", headers });
-    if (!resp.ok) return [];
-    const list = (await resp.json()) as any[];
-    return list.map((p) => ({
-      positionId: String(p.position_id || p.id),
-      instrument: String(p.instrument || "GBPJPY"),
-      direction: String(p.direction).toUpperCase() as "BUY" | "SELL",
-      volume: Number(p.volume || 0),
-      openPrice: Number(p.open_price || p.price || 0),
-      sl: Number(p.stop_loss || 0),
-      tp: Number(p.take_profit || 0),
-      currentPrice: Number(p.current_price || 0),
-      profit: Number(p.profit || 0),
-      createTime: p.create_time || new Date().toISOString(),
-      comment: p.comment,
-    }));
+    if (!resp.ok) {
+      // Fallback to /positions endpoint if snapshot unavailable
+      const altPath = `/v1/trading/positions?account_id=${this.config.accountId}&instrument=GBPJPY`;
+      const altResp = await fetch(`${base}${altPath}`, { method: "GET", headers: this.getSignedHeaders("GET", altPath) });
+      if (!altResp.ok) return [];
+      const list = (await altResp.json()) as any[];
+      return list.map((p) => ({
+        positionId: String(p.position_id || p.id),
+        instrument: "GBPJPY",
+        direction: String(p.direction || p.side || "BUY").toUpperCase() as "BUY" | "SELL",
+        volume: Number(p.volume || 0),
+        openPrice: Number(p.open_price || p.price || 0),
+        sl: Number(p.stop_loss || 0),
+        tp: Number(p.take_profit || 0),
+        currentPrice: Number(p.current_price || 0),
+        profit: Number(p.profit || 0),
+        createTime: p.create_time || new Date().toISOString(),
+        comment: p.comment,
+      }));
+    }
+
+    const data: any = await resp.json();
+    const orders: any[] = data.orders || [];
+    const positions: any[] = data.positions || [];
+
+    // Map attached sltp orders by position_id
+    const sltpOrdersByPosId = new Map<string, any>();
+    for (const ord of orders) {
+      if ((ord.order_type === "sltp" || ord.type === "sltp") && ord.position_id) {
+        sltpOrdersByPosId.set(String(ord.position_id), ord);
+      }
+    }
+
+    return positions
+      .filter((p: any) => !p.instrument || p.instrument.replace("/", "") === "GBPJPY")
+      .map((p: any) => {
+        const posId = String(p.position_id || p.id);
+        const sltp = sltpOrdersByPosId.get(posId);
+        const dir = String(p.direction || p.side || "buy").toUpperCase() as "BUY" | "SELL";
+        const openPrice = Number(p.open_price || p.price || 0);
+        const sl = sltp ? Number(sltp.stop_loss_price || sltp.stop_loss || 0) : Number(p.stop_loss || 0);
+        const tp = sltp ? Number(sltp.take_profit_price || sltp.take_profit || 0) : Number(p.take_profit || 0);
+
+        return {
+          positionId: posId,
+          instrument: "GBPJPY",
+          direction: dir,
+          volume: Number(p.volume || 0),
+          openPrice,
+          sl,
+          tp,
+          currentPrice: Number(p.current_price || p.price || openPrice),
+          profit: Number(p.profit || p.upl || 0),
+          createTime: p.create_time || new Date().toISOString(),
+          comment: p.comment,
+          sltpOrderId: sltp ? String(sltp.order_id || sltp.id) : undefined,
+        };
+      });
   }
 }

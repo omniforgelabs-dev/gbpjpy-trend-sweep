@@ -29,6 +29,7 @@ export interface ManagedTradeState {
   openedAt: string;
   candleBarTime: string;
   dollarRisk: number;
+  sltpOrderId?: string;
 }
 
 export interface ClosedTradeRecord {

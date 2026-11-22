@@ -123,6 +123,89 @@ if (fs.existsSync(testStateFile)) {
   assert(newBarAllowed.allowed === true, "6f. Fresh candle bar allowed after trade closed");
 }
 
+// 7. Ephemeral Host Broker Reconciliation Verification (Render Free Container Wipe)
+{
+  const ephemeralStateFile = path.join(process.cwd(), "test", "data", "test_ephemeral_state.json");
+  if (fs.existsSync(ephemeralStateFile)) fs.unlinkSync(ephemeralStateFile);
+
+  const sm = new StateManager(ephemeralStateFile);
+  assert(sm.getActiveTrade() === null, "7a. Local state starts empty after ephemeral restart");
+
+  // Simulated broker position returned by Exness API snapshot
+  const brokerPosition = {
+    positionId: "exn_pos_987654",
+    instrument: "GBPJPY",
+    direction: "BUY" as const,
+    volume: 0.002,
+    openPrice: 208.50,
+    sl: 208.20,
+    tp: 208.80,
+    sltpOrderId: "sltp_ord_112233",
+    createTime: new Date().toISOString(),
+  };
+
+  // Reconstruct trade state from broker ticket
+  const slDist = Math.abs(brokerPosition.openPrice - brokerPosition.sl);
+  const isBe = Math.abs(brokerPosition.sl - brokerPosition.openPrice) < 0.05;
+  const reconstructed: ManagedTradeState = {
+    tradeId: `ts_broker_${brokerPosition.positionId}`,
+    brokerPositionId: brokerPosition.positionId,
+    pair: "GBP/JPY",
+    direction: brokerPosition.direction,
+    entryPrice: brokerPosition.openPrice,
+    initialSl: brokerPosition.sl,
+    currentSl: brokerPosition.sl,
+    tp1: brokerPosition.tp,
+    tp2: Number((brokerPosition.openPrice + slDist * 2.5).toFixed(3)),
+    riskDistance: slDist,
+    volume: brokerPosition.volume,
+    remainingVolume: brokerPosition.volume,
+    tp1Hit: isBe,
+    beActive: isBe,
+    openedAt: brokerPosition.createTime,
+    candleBarTime: new Date().toISOString(),
+    dollarRisk: 1.00,
+    sltpOrderId: brokerPosition.sltpOrderId,
+  };
+
+  sm.recordTradeOpen(reconstructed);
+  const recovered = sm.getActiveTrade();
+
+  assert(recovered !== null, "7b. Broker trade successfully reconciled into state");
+  assert(recovered?.brokerPositionId === "exn_pos_987654", "7c. Broker position ID preserved");
+  assert(recovered?.initialSl === 208.20, "7d. Stop-loss preserved accurately");
+  assert(recovered?.tp1 === 208.80, "7e. Target 1 preserved accurately");
+  assert(recovered?.tp2 === 209.25, "7f. Target 2 runner calculated accurately (209.25)");
+  assert(recovered?.sltpOrderId === "sltp_ord_112233", "7g. SLTP order ID attached for safe BE updates");
+  assert(recovered?.tp1Hit === false, "7h. Initial trade correctly marked as awaiting TP1");
+
+  // Gate check: single-position safety rule prevents duplicate entries
+  const blockGate = sm.canEnterSignal(new Date().toISOString());
+  assert(blockGate.allowed === false, "7i. Single-position rule strictly blocks duplicate trades while broker trade is active");
+
+  // Now test state when position was already moved to Breakeven by broker
+  const beBrokerPosition = {
+    ...brokerPosition,
+    sl: 208.50, // SL moved to BE!
+    volume: 0.001, // 50% already closed
+  };
+  const isBeAlready = Math.abs(beBrokerPosition.sl - beBrokerPosition.openPrice) < 0.05;
+  const beReconstructed: ManagedTradeState = {
+    ...reconstructed,
+    currentSl: beBrokerPosition.sl,
+    volume: beBrokerPosition.volume,
+    remainingVolume: beBrokerPosition.volume,
+    tp1Hit: isBeAlready,
+    beActive: isBeAlready,
+  };
+  sm.recordTradeOpen(beReconstructed);
+  const beRecovered = sm.getActiveTrade();
+  assert(beRecovered?.tp1Hit === true, "7j. BE trade correctly recognizes TP1 was already reached");
+  assert(beRecovered?.beActive === true, "7k. BE trade correctly maintains Breakeven lock");
+
+  if (fs.existsSync(ephemeralStateFile)) fs.unlinkSync(ephemeralStateFile);
+}
+
 // Cleanup test file
 if (fs.existsSync(testStateFile)) {
   fs.unlinkSync(testStateFile);
