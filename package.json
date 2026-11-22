@@ -1,0 +1,32 @@
+{
+  "name": "gbpjpy-trend-sweep",
+  "version": "1.0.0",
+  "description": "Headless GBP/JPY Trend Sweep Automated Trading Bot (Exness Direct API)",
+  "main": "dist/bot.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/bot.ts",
+    "start:prod": "node dist/bot.js",
+    "test": "tsx test/runAllTests.ts",
+    "test:strategy": "tsx test/trendSweep.test.ts",
+    "test:risk": "tsx test/positionSizer.test.ts",
+    "test:broker": "tsx test/exnessClient.test.ts",
+    "test:integration": "tsx test/botIntegration.test.ts"
+  },
+  "keywords": [
+    "trading-bot",
+    "gbpjpy",
+    "trend-sweep",
+    "exness",
+    "smc",
+    "forex"
+  ],
+  "author": "OmniForge Quant",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}

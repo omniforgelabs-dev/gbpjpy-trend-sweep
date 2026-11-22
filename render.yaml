@@ -1,0 +1,26 @@
+services:
+  - type: worker
+    name: gbpjpy-trend-sweep
+    runtime: node
+    plan: starter
+    buildCommand: npm install && npm run build
+    startCommand: npm run start:prod
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: EXN_IS_DEMO
+        value: "true"
+      - key: EXN_DISCOVERY_BASE_URL
+        value: "https://gateway.exness.com"
+      - key: MAX_RISK_USD
+        value: "1.00"
+      - key: POLL_INTERVAL_MS
+        value: "60000"
+      - key: EXN_DRY_RUN
+        value: "false"
+      - key: EXN_API_KEY
+        sync: false
+      - key: EXN_PRIVATE_KEY
+        sync: false
+      - key: EXN_ACCOUNT_ID
+        sync: false
