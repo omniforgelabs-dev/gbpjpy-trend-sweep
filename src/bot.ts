@@ -16,13 +16,15 @@
 import http from "node:http";
 import { ExnessClient } from "./broker/exnessClient.js";
 import { StateManager, ManagedTradeState } from "./state/stateManager.js";
-import { evaluateGbpJpyTrendSweep, Candle } from "./strategy/trendSweep.js";
+import { Candle, parseIsoSeconds } from "./strategy/trendSweep.js";
+import { evaluateGbpJpyConfluence } from "./strategy/confluenceEvaluator.js";
 import { calculateGbpJpyPositionSize } from "./risk/positionSizer.js";
 import { startHealthServer, BotHealthStatus, HealthStatusProvider } from "./healthServer.js";
 
 // Configuration options from environment
 const CHECK_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "60000", 10);
 const MAX_RISK_USD = parseFloat(process.env.MAX_RISK_USD || "1.00");
+const CONFLUENCE_MODE = process.env.CONFLUENCE_MODE !== "false"; // default true (APEX 1-to-1 Confluence Parity)
 
 export class GbpJpyBot implements HealthStatusProvider {
   private exness: ExnessClient;
@@ -32,6 +34,9 @@ export class GbpJpyBot implements HealthStatusProvider {
   private httpServer: http.Server | null = null;
   private startTime = Date.now();
   private lastHeartbeat = new Date().toISOString();
+  private lastScanCheck = "Initializing";
+  private lastScanRegime = "UNCLEAR";
+  private lastScanScore = 0;
 
   constructor() {
     this.exness = new ExnessClient();
@@ -49,6 +54,7 @@ export class GbpJpyBot implements HealthStatusProvider {
     console.log("═══════════════════════════════════════════════════════════════");
     console.log(`  Environment Mode:    ${this.exness.isDemoAccount() ? "DEMO (Testing)" : "LIVE REAL ACCOUNT"}`);
     console.log(`  Execution Engine:    ${this.exness.isSimulated() ? "SANDBOX SIMULATION" : "EXNESS DIRECT REST API"}`);
+    console.log(`  Confluence Mode:     ${CONFLUENCE_MODE ? "ENABLED (APEX 1-to-1 Confluence Parity)" : "DISABLED (Pure Trend Sweep Only)"}`);
     console.log(`  Gateway Host:        ${this.exness.getConfiguredGatewayHost()}`);
     console.log(`  State Mount File:    ${this.state.getFilePath()}`);
     console.log(`  Max Intended Risk:   $${MAX_RISK_USD.toFixed(2)} USD per trade`);
@@ -102,10 +108,15 @@ export class GbpJpyBot implements HealthStatusProvider {
       pair: "GBP/JPY",
       mode: this.exness.isDemoAccount() ? "demo" : "live",
       executionEngine: this.exness.isSimulated() ? "simulation" : "exness-rest-api",
+      confluenceMode: CONFLUENCE_MODE,
       uptimeSeconds: Math.floor((Date.now() - this.startTime) / 1000),
       activeTrade: active !== null,
       activeTradeId: active?.tradeId || null,
       lastHeartbeat: this.lastHeartbeat,
+      lastScanCheck: this.lastScanCheck,
+      lastScanRegime: this.lastScanRegime,
+      lastScanScore: this.lastScanScore,
+      resolvedAccessPoint: this.exness.getResolvedAccessPoint(),
       timestamp: new Date().toISOString(),
     };
   }
@@ -133,7 +144,10 @@ export class GbpJpyBot implements HealthStatusProvider {
       if (!active && !this.exness.isSimulated()) {
         try {
           const brokerPositions = await this.exness.getOpenPositions();
-          const gbpPos = brokerPositions.find((p) => p.instrument === "GBPJPY");
+          const gbpPos = brokerPositions.find((p) => {
+            const clean = String(p.instrument || "").toUpperCase().replace(/[^A-Z]/g, "");
+            return clean.includes("GBPJPY");
+          });
           if (gbpPos) {
             console.log(`[RECONCILE] Recovered active GBP/JPY position from Exness broker: ${gbpPos.positionId} (${gbpPos.direction} ${gbpPos.volume} lots @ ${gbpPos.openPrice})`);
             const slDist = Math.abs(gbpPos.openPrice - (gbpPos.sl || (gbpPos.direction === "BUY" ? gbpPos.openPrice - 0.30 : gbpPos.openPrice + 0.30)));
@@ -178,12 +192,13 @@ export class GbpJpyBot implements HealthStatusProvider {
       }
 
       // 3. Fetch Market Data for Evaluation
-      const [m15Candles, h1Candles, d1Candles, usdJpyRate, account] = await Promise.all([
+      const [m15Candles, h1Candles, d1Candles, usdJpyRate, account, liveQuote] = await Promise.all([
         this.exness.getCandles("M15", 50).catch(() => [] as Candle[]),
         this.exness.getCandles("H1", 40).catch(() => [] as Candle[]),
         this.exness.getCandles("D1", 10).catch(() => [] as Candle[]),
         this.exness.getLiveUsdJpyRate().catch(() => 155.0),
         this.exness.getAccount().catch(() => ({ balance: 10.0 })),
+        this.exness.getQuote("GBPJPY").catch(() => undefined),
       ]);
 
       if (m15Candles.length < 35 || h1Candles.length < 25) {
@@ -191,17 +206,35 @@ export class GbpJpyBot implements HealthStatusProvider {
         return;
       }
 
-      // 4. Run Original GBP/JPY Trend Sweep Evaluator
-      const result = evaluateGbpJpyTrendSweep(m15Candles, h1Candles, undefined, d1Candles);
+      // Ensure we evaluate the latest CLOSED M15 candle only (drop forming bar if present)
+      // Exness Market Data returns the forming candle whose timestamp is the start of the current 15m window.
+      const lastM15 = m15Candles[m15Candles.length - 1];
+      const lastBarSec = parseIsoSeconds(lastM15?.time);
+      const nowSec = Math.floor(now.getTime() / 1000);
+      const isForming = (nowSec - lastBarSec) < 900;
+      const closedM15Candles = isForming && m15Candles.length > 35 ? m15Candles.slice(0, -1) : m15Candles;
+
+      // 4. Run GBP/JPY Evaluator (APEX Confluence Mode by default, or pure Trend Sweep)
+      const result = evaluateGbpJpyConfluence(
+        closedM15Candles,
+        h1Candles,
+        d1Candles,
+        liveQuote ? { bid: liveQuote.bid, ask: liveQuote.ask } : undefined,
+        now,
+        CONFLUENCE_MODE
+      );
+
+      this.lastScanCheck = result.checks[result.checks.length - 1] || "No signal";
+      this.lastScanRegime = result.h1MacroTrend;
+      this.lastScanScore = result.totalScore;
 
       if (!result.passed || !result.setup) {
-        const lastCheck = result.checks[result.checks.length - 1] || "No signal";
-        console.log(`[SCAN ${now.toISOString()}] GBP/JPY: ${result.macroRegime} regime · ${lastCheck}`);
+        console.log(`[SCAN ${now.toISOString()}] GBP/JPY: ${result.h1MacroTrend} regime · ${result.confluenceGrade} (${result.totalScore}% Confluence) · ${this.lastScanCheck}`);
         return;
       }
 
       const s = result.setup;
-      console.log(`\n🔥 [SIGNAL DETECTED] GBP/JPY ${s.direction} at ${s.entry} | SL: ${s.sl} | TP1: ${s.tp1} | TP2: ${s.tp2} (Risk Dist: ${s.risk})`);
+      console.log(`\n🔥 [SIGNAL DETECTED via ${result.sourceEngine}] GBP/JPY ${s.direction} at ${s.entry} | SL: ${s.sl} | TP1: ${s.tp1} | TP2: ${s.tp2} (Risk Dist: ${s.risk})`);
 
       // 5. Deduplication and Frequency Gate
       const gate = this.state.canEnterSignal(s.barTime);
@@ -233,7 +266,7 @@ export class GbpJpyBot implements HealthStatusProvider {
         volume: sizing.permittedVolume,
         sl: s.sl,
         tp1: s.tp1,
-        comment: "TrendSweep_GBPJPY",
+        comment: result.sourceEngine.includes("Synthesizer") ? "ApexConfluence_GBPJPY" : "TrendSweep_GBPJPY",
       });
 
       if (!orderRes.success) {

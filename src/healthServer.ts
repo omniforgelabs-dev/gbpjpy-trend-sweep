@@ -22,10 +22,15 @@ export interface BotHealthStatus {
   pair: string;
   mode: "demo" | "live";
   executionEngine: string;
+  confluenceMode?: boolean;
   uptimeSeconds: number;
   activeTrade: boolean;
   activeTradeId: string | null;
   lastHeartbeat: string;
+  lastScanCheck?: string;
+  lastScanRegime?: string;
+  lastScanScore?: number;
+  resolvedAccessPoint?: string | null;
   timestamp: string;
 }
 

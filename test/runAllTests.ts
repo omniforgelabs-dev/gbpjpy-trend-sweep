@@ -7,6 +7,7 @@ import path from "node:path";
 
 const suites = [
   "test/trendSweep.test.ts",
+  "test/confluenceEvaluator.test.ts",
   "test/positionSizer.test.ts",
   "test/exnessClient.test.ts",
   "test/botIntegration.test.ts",

@@ -253,13 +253,20 @@ export class ExnessClient {
     const path = `/v1/trading/access-point?account_id=${this.config.accountId}`;
 
     // Candidate Gateway hosts: User-configured gateway host first, then known live gateways
-    const candidates = [
+    const rawCandidates: string[] = [
       this.config.gatewayHost,
+      this.config.discoveryBaseUrl || "",
       "https://api.exness-api.com",
       "https://api.exness.com",
-    ].filter(Boolean).map((h) => this.normalizeUrl(h));
+    ].filter(Boolean);
+    const candidates = rawCandidates.map((h) => this.normalizeUrl(h));
 
-    const uniqueCandidates = Array.from(new Set(candidates));
+    // Filter out known non-resolving mock hosts (e.g. gateway.exness.com)
+    const candidateHosts = candidates.filter((h) => !h.includes("gateway.exness.com"));
+    if (candidateHosts.length === 0) {
+      candidateHosts.push("https://api.exness-api.com");
+    }
+    const uniqueCandidates = Array.from(new Set(candidateHosts));
 
     for (const gateway of uniqueCandidates) {
       try {
@@ -692,7 +699,11 @@ export class ExnessClient {
     }
 
     return positions
-      .filter((p: any) => !p.instrument || p.instrument.replace("/", "") === "GBPJPY")
+      .filter((p: any) => {
+        if (!p.instrument) return true;
+        const clean = String(p.instrument).toUpperCase().replace(/[^A-Z]/g, "");
+        return clean.includes("GBPJPY");
+      })
       .map((p: any) => {
         const posId = String(p.position_id || p.id);
         const sltp = sltpOrdersByPosId.get(posId);

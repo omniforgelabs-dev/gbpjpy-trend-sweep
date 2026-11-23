@@ -10,6 +10,7 @@
     "start:prod": "node dist/bot.js",
     "test": "tsx test/runAllTests.ts",
     "test:strategy": "tsx test/trendSweep.test.ts",
+    "test:confluence": "tsx test/confluenceEvaluator.test.ts",
     "test:risk": "tsx test/positionSizer.test.ts",
     "test:broker": "tsx test/exnessClient.test.ts",
     "test:integration": "tsx test/botIntegration.test.ts",
