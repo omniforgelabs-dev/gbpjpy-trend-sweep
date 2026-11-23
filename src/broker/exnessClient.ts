@@ -221,7 +221,11 @@ export class ExnessClient {
 
     return {
       "Content-Type": "application/json",
+      "User-Agent": "ApexTradingSystem/1.0",
       "EXN-API-KEY": this.config.apiKey,
+      "EXN-IDEMPOTENCY-KEY": idempotencyKey,
+      "EXN-TIMESTAMP": String(timestamp),
+      "EXN-SIGN-VERSION": "1",
       "EXN-DATA": exnData,
       "EXN-SIGN": exnSign,
     };
@@ -253,7 +257,6 @@ export class ExnessClient {
       this.config.gatewayHost,
       "https://api.exness-api.com",
       "https://api.exness.com",
-      "https://gateway.exness.com",
     ].filter(Boolean).map((h) => this.normalizeUrl(h));
 
     const uniqueCandidates = Array.from(new Set(candidates));
@@ -263,7 +266,7 @@ export class ExnessClient {
         const url = `${gateway}${path}`;
         const headers = this.getSignedHeaders("GET", path);
 
-        const resp = await fetch(url, { method: "GET", headers });
+        const resp = await fetch(url, { method: "GET", headers, signal: AbortSignal.timeout(15000) });
         if (resp.ok) {
           const data: any = await resp.json();
           const endpoint = data.access_point || data.accessPoint || data.endpoint || data.url || data.data?.access_point;
@@ -274,10 +277,11 @@ export class ExnessClient {
             return this.accessPointUrl;
           }
         } else {
-          console.warn(`[EXNESS] Gateway ${gateway} returned status ${resp.status} for access-point discovery.`);
+          const errText = await resp.text().catch(() => "");
+          console.warn(`[EXNESS] Gateway ${gateway} returned status ${resp.status} for access-point discovery: ${errText}`);
         }
       } catch (err: any) {
-        // Continue to next candidate
+        console.warn(`[EXNESS] Gateway ${gateway} access-point request error: ${err.message}`);
       }
     }
 
